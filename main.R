@@ -82,6 +82,65 @@ get_bin_counts = function(Y, bin_edges, K) {
   }
   return(counts_matrix)
 }
+## Jackknife estimator 
+jackknife_se = function(Y1, Y2, est_grid, K, p, ncells) {
+  n1 <- nrow(Y1)
+  n2 <- nrow(Y2)
+  n = n1 + n2 
+  # Store all Jackknife estimates
+  jackknife_estimates <- matrix(0, nrow = n, ncol = p + 1) 
+  # p + 1 for Intercept and coefficients 
+  for (i in 1:n) {
+    if (i <= n1){
+      # Remove the ith individual from group 1
+      Y1_jack <- Y1[-i, ]
+      Y2_jack <- Y2
+    } else {
+      # Remove the (i - n1)th individual from group 2
+      Y1_jack <- Y1
+      Y2_jack <- Y2[-(i - n1), ]
+    }
+    # Calculate Smat1 and Smat2 using the helper function `get_bin_counts`
+    Smat1_jack <- get_bin_counts(Y1_jack, bin_edges = est_grid, K)
+    Smat2_jack <- get_bin_counts(Y2_jack, bin_edges = est_grid, K)
+    Smat_jack <- rbind(Smat1_jack, Smat2_jack) 
+    tk <- (est_grid[-1] + est_grid[-length(est_grid)]) / 2 
+    X <- rep(1, length(tk))
+    for (dim in 1:p) {
+      X <- cbind(X, tk^dim)
+    }
+    varb <- paste0("X_", 1:p)
+    colnames(X) <- c("Intercept", varb)
+    
+    
+    S1sum_jack <- colSums(Smat1_jack)
+    S2sum_jack <- colSums(Smat2_jack)
+    carrier_jack <- density(x = c(as.vector(Y1_jack), as.vector(Y2_jack)), kernel = "gaussian", n = K, from = min(c(Y1_jack, Y2_jack)), to = max(c(Y1_jack, Y2_jack))) 
+    scale_factor <- (ncells * nrow(Smat_jack)) / sum(carrier_jack$y) 
+    carrier_est_jack <- carrier_jack$y * scale_factor 
+    
+    df1_jack <- as.data.frame(cbind(S1sum_jack, carrier_est_jack, X))
+    df2_jack <- as.data.frame(cbind(S2sum_jack, carrier_est_jack, X))
+    colnames(df1_jack)[1] <- "sum_cts"
+    colnames(df2_jack)[1] <- "sum_cts"
+    formula <- as.formula(paste0('sum_cts ~ offset(log(carrier_est_jack)) + ', paste(varb, collapse = '+')))
+    # Fit GLM model for the Jackknife sample
+    fit_gp1_jack <- tryCatch(glm(formula, family = poisson(link = "log"), data = df1_jack), error = function(e) NULL)
+    fit_gp2_jack <- tryCatch(glm(formula, family = poisson(link = "log"), data = df2_jack), error = function(e) NULL)
+    if (!is.null(fit_gp1_jack) && !is.null(fit_gp2_jack)) {
+      beta1_jack <- as.vector(fit_gp1_jack$coefficients)
+      beta2_jack <- as.vector(fit_gp2_jack$coefficients)
+      # Store the difference in estimates
+      jackknife_estimates[i, ] <- beta1_jack - beta2_jack
+    } else {
+      jackknife_estimates[i, ] <- NA
+    }
+  }
+  mean_estimates = colMeans(jackknife_estimates, na.rm = TRUE) 
+  jackknife_var = (n - 1) / n * rowSums((t(jackknife_estimates) - mean_estimates)^2, na.rm = TRUE)
+  jackknife_se = sqrt(jackknife_var) 
+  return(jackknife_se)
+}
 
 # Specify the parameters  
 alpha1 = 0; alpha2 = 0
@@ -91,7 +150,7 @@ sigma1 = 1; sigma2 = 1
 n1 = 200; n2 = 200
 ncells = 1000 ; p = 3 
 K = 200 # Number of bins 
-maxIter = 20
+maxIter = 30
 
 
 repID = 2 # Make sure the code is reproducible 
@@ -107,6 +166,7 @@ nCPUS = 5
 #}
 pvMat_mom = NULL
 pvMat_beta = NULL
+pvMat_jack = NULL
 for (iter in 1:maxIter) {
   simData = simu_hier(alpha1 = alpha1, alpha2 = alpha2, tau1 = tau1, tau2 = tau2, sigma1 = sigma1, sigma2 = sigma2, n1 = n1, n2 = n2, ncells = ncells)
   Y1 = simData$Y1
@@ -201,91 +261,94 @@ for (iter in 1:maxIter) {
   Zscore_beta = beta_sum_diff/sqrt(diag(Cov_beta1 + Cov_beta2) )
   pv_beta = 2*pnorm( -abs(Zscore_beta) ) 
   
-  # Bootstrap method to evaluate the uncertainty of beta
-  B = 200
-  betaMat_diff_b = NULL
-  ZscoreMat_b = NULL
-  start.time <- Sys.time()
-  for (b in 1:B) {
-    Y1b = NULL
-    Y2b = NULL
-    for (i in 1:n1 ) {
-      Y1b = rbind(Y1b, Y1[i, ][ sample(ncol(Y1), replace = T) ] )
-    }
-    for (i in 1:n2 ) {
-      Y2b = rbind(Y2b, Y2[i, ][ sample(ncol(Y2), replace = T) ] )
-    }
-
-    y1b = as.vector(c(Y1b))
-    y2b = as.vector(c(Y2b))
-    y_agg_b = c(y1b, y2b)
-    Smat1_b = matrix(NA, nrow = n1, ncol = K) #group 1 COUNTS matrix for one epoch
-    Smat2_b = matrix(NA, nrow = n2, ncol = K) #group 2 COUNTS for one epoch
-
-    Smat1_b = get_bin_counts(Y1b, bin_edges = est_grid, K)
-    Smat2_b = get_bin_counts(Y2b, bin_edges = est_grid, K)
-    Smat_b = rbind(Smat1_b, Smat2_b)
-    S1sum_b = colSums(Smat1_b)
-    S2sum_b = colSums(Smat2_b)
-
-    carrier_b = density(x = y_agg_b, kernel = c("gaussian"), n = K, from = l, to = u )
-    scale_factor_b = (ncells*nrow(Smat_b))/sum(carrier_b$y)
-    carrier_est_b = carrier_b$y*scale_factor_b # Better to sum
-    df1_b = as.data.frame(cbind( S1sum_b, carrier_est_b, X))
-    df2_b = as.data.frame(cbind( S2sum_b, carrier_est_b, X))
-    colnames(df1_b)[1] = "sum_cts"
-    colnames(df2_b)[1] = "sum_cts"
-    formula = as.formula( paste0('sum_cts~offset(log(carrier_est))+', paste(varb, collapse = '+')))
-
-    sef_gp1_sum_b = tryCatch(glm(
-      formula,
-      family = poisson(link="log"),
-      data = df1_b
-    ))
-
-    sef_gp2_sum_b = tryCatch(glm(
-      formula,
-      family = poisson(link="log"),
-      data = df2_b
-    ))
-    beta1_b = as.vector(sef_gp1_sum_b$coefficients)
-    beta2_b = as.vector(sef_gp2_sum_b$coefficients)
-    beta_diff_b = beta1_b - beta2_b
-    betaMat_diff_b = rbind(betaMat_diff_b, beta_diff_b)
-
-    sef_df1_b = as.vector( carrier_est_b * exp(X %*% beta1_b) )
-    sef_df2_b = as.vector( carrier_est_b * exp(X %*% beta2_b) )
-
-    X_dec = t( t(X) - colMeans(X))[ ,-1]
-    Sand1_b = t(X_dec) %*% ( sef_df1_b * X_dec )/(n1*ncells)
-    Sand2_b = t(X_dec) %*% ( sef_df2_b * X_dec )/(n2*ncells)
-    Sand1_inv_b = solve(Sand1_b)
-    Sand2_inv_b = solve(Sand2_b)
-    Cov_beta1_b = Sand1_inv_b%*%Cov1%*%Sand1_inv_b
-    Cov_beta2_b = Sand2_inv_b%*%Cov2%*%Sand2_inv_b
-    Zscore_b = (beta_diff_b[-1] - beta_sum_diff)/sqrt(diag(Cov_beta1_b + Cov_beta2_b) )
-    ZscoreMat_b = rbind(ZscoreMat_b, Zscore_b)
-    
-  }
-  end.time <- Sys.time()
-  time.taken <- end.time - start.time
-  time.taken
-  # 1. Using the boostrap covariance matrix 
-  sd_boot = apply(betaMat_diff_b[ ,-1], 2,sd)
-  pvBoot_sd = 2*pnorm(-abs(beta_sum_diff/sd_boot ))
+  sd_jack = jackknife_se(Y1, Y2, est_grid=est_grid, K, p, ncells)
+  Zscore_jack = beta_sum_diff/sd_jack[-1] 
+  pv_jack = 2*pnorm(-abs(Zscore_jack) )
   
-  pvBoot = NULL
-  for (i in 1:ncol(ZscoreMat_b)) {
-     pvBoot = c(pvBoot, mean( abs(ZscoreMat_b[ ,i ]) > abs(Zscore_beta[i]) ) )
-  }
-
+  # # Bootstrap method to evaluate the uncertainty of beta
+  # B = 200
+  # betaMat_diff_b = NULL
+  # ZscoreMat_b = NULL
+  # start.time <- Sys.time()
+  # for (b in 1:B) {
+  #   Y1b = NULL
+  #   Y2b = NULL
+  #   for (i in 1:n1 ) {
+  #     Y1b = rbind(Y1b, Y1[i, ][ sample(ncol(Y1), replace = T) ] )
+  #   }
+  #   for (i in 1:n2 ) {
+  #     Y2b = rbind(Y2b, Y2[i, ][ sample(ncol(Y2), replace = T) ] )
+  #   }
+  # 
+  #   y1b = as.vector(c(Y1b))
+  #   y2b = as.vector(c(Y2b))
+  #   y_agg_b = c(y1b, y2b)
+  #   Smat1_b = matrix(NA, nrow = n1, ncol = K) #group 1 COUNTS matrix for one epoch
+  #   Smat2_b = matrix(NA, nrow = n2, ncol = K) #group 2 COUNTS for one epoch
+  # 
+  #   Smat1_b = get_bin_counts(Y1b, bin_edges = est_grid, K)
+  #   Smat2_b = get_bin_counts(Y2b, bin_edges = est_grid, K)
+  #   Smat_b = rbind(Smat1_b, Smat2_b)
+  #   S1sum_b = colSums(Smat1_b)
+  #   S2sum_b = colSums(Smat2_b)
+  # 
+  #   carrier_b = density(x = y_agg_b, kernel = c("gaussian"), n = K, from = l, to = u )
+  #   scale_factor_b = (ncells*nrow(Smat_b))/sum(carrier_b$y)
+  #   carrier_est_b = carrier_b$y*scale_factor_b # Better to sum
+  #   df1_b = as.data.frame(cbind( S1sum_b, carrier_est_b, X))
+  #   df2_b = as.data.frame(cbind( S2sum_b, carrier_est_b, X))
+  #   colnames(df1_b)[1] = "sum_cts"
+  #   colnames(df2_b)[1] = "sum_cts"
+  #   formula = as.formula( paste0('sum_cts~offset(log(carrier_est))+', paste(varb, collapse = '+')))
+  # 
+  #   sef_gp1_sum_b = tryCatch(glm(
+  #     formula,
+  #     family = poisson(link="log"),
+  #     data = df1_b
+  #   ))
+  # 
+  #   sef_gp2_sum_b = tryCatch(glm(
+  #     formula,
+  #     family = poisson(link="log"),
+  #     data = df2_b
+  #   ))
+  #   beta1_b = as.vector(sef_gp1_sum_b$coefficients)
+  #   beta2_b = as.vector(sef_gp2_sum_b$coefficients)
+  #   beta_diff_b = beta1_b - beta2_b
+  #   betaMat_diff_b = rbind(betaMat_diff_b, beta_diff_b)
+  # 
+  #   sef_df1_b = as.vector( carrier_est_b * exp(X %*% beta1_b) )
+  #   sef_df2_b = as.vector( carrier_est_b * exp(X %*% beta2_b) )
+  # 
+  #   X_dec = t( t(X) - colMeans(X))[ ,-1]
+  #   Sand1_b = t(X_dec) %*% ( sef_df1_b * X_dec )/(n1*ncells)
+  #   Sand2_b = t(X_dec) %*% ( sef_df2_b * X_dec )/(n2*ncells)
+  #   Sand1_inv_b = solve(Sand1_b)
+  #   Sand2_inv_b = solve(Sand2_b)
+  #   Cov_beta1_b = Sand1_inv_b%*%Cov1%*%Sand1_inv_b
+  #   Cov_beta2_b = Sand2_inv_b%*%Cov2%*%Sand2_inv_b
+  #   Zscore_b = (beta_diff_b[-1] - beta_sum_diff)/sqrt(diag(Cov_beta1_b + Cov_beta2_b) )
+  #   ZscoreMat_b = rbind(ZscoreMat_b, Zscore_b)
+  #   
+  # }
+  # end.time <- Sys.time()
+  # time.taken <- end.time - start.time
+  # time.taken
+  # # 1. Using the boostrap covariance matrix 
+  # sd_boot = apply(betaMat_diff_b[ ,-1], 2,sd)
+  # pvBoot_sd = 2*pnorm(-abs(beta_sum_diff/sd_boot ))
+  # pvBoot = NULL
+  # for (i in 1:ncol(ZscoreMat_b)) {
+  #    pvBoot = c(pvBoot, mean( abs(ZscoreMat_b[ ,i ]) > abs(Zscore_beta[i]) ) )
+  # }
 
   pvMat_mom = rbind(pvMat_mom, pv_mom)
   pvMat_beta = rbind(pvMat_beta, pv_beta)
+  pvMat_jack = rbind(pvMat_jack, pv_jack)
 }
 
 
-library(ggplot2)
+  library(ggplot2)
 gg_qqplot <- function(ps, ci = 0.95) {
   n  <- length(ps)
   df <- data.frame(
@@ -301,8 +364,8 @@ gg_qqplot <- function(ps, ci = 0.95) {
       mapping = aes(x = expected, ymin = clower, ymax = cupper),
       alpha = 0.1
     ) +
-    geom_point(aes(expected, observed), shape = 1, size = 3) +
-    #geom_point(aes(expected, observed)) +
+    #geom_point(aes(expected, observed), shape = 1, size = 3) +
+    geom_point(aes(expected, observed)) +
     geom_abline(intercept = 0, slope = 1, alpha = 0.5) +
     # geom_line(aes(expected, cupper), linetype = 2, size = 0.5) +
     # geom_line(aes(expected, clower), linetype = 2, size = 0.5) +
@@ -319,6 +382,7 @@ gg_qqplot <- function(ps, ci = 0.95) {
 
 pvMat_mom
 pvMat_beta
+pvMat_jack
 
 gg_qqplot(pvMat_mom[,1]) 
 gg_qqplot(pvMat_mom[,2]) 
@@ -328,7 +392,85 @@ gg_qqplot(pvMat_beta[,1])
 gg_qqplot(pvMat_beta[,2]) 
 gg_qqplot(pvMat_beta[,3]) 
 
+gg_qqplot(pvMat_jack[,1])
+gg_qqplot(pvMat_jack[,2])
+gg_qqplot(pvMat_jack[,3])
 
 
 
+# Bootstrap method to evaluate the uncertainty of beta
+B = 100 
+# Function to perform bootstrap resampling and compute estimates
+# For now, we only consider the percentile bootstrap and studentized Bootstrap
+# Both of them are based on non-parametric bootstrap
+bootstrap_analysis <- function(Y1, Y2, X, est_grid, K, l, u, B, ncells) {
+  # Initialize matrices to store bootstrap results
+  n1 = nrow(Y1)
+  n2 = nrow(Y2)
+  betaMat_diff_b <- matrix(NA, nrow = B, ncol = ncol(X) )
+  ZscoreMat_b <- NULL  # This can be used if needed for z-scores
+  X_dec = t( t(X) - colMeans(X))[ ,-1] # Centralized sufficient statistics 
+  # Loop over the number of bootstrap iterations
+  for (b in 1:B) {
+    # Bootstrap resampling for each individual
+    Y1b <- t(apply(Y1, 1, function(row) sample(row, replace = TRUE)))
+    Y2b <- t(apply(Y2, 1, function(row) sample(row, replace = TRUE)))
+    # Flatten the resampled data
+    y1b <- as.vector(c(Y1b))
+    y2b <- as.vector(c(Y2b))
+    y_agg_b <- c(y1b, y2b)
+    # Compute bin counts using the optimized method
+    Smat1_b <- get_bin_counts(Y1b, bin_edges = est_grid, K)
+    Smat2_b <- get_bin_counts(Y2b, bin_edges = est_grid, K)
+    Smat_b <- rbind(Smat1_b, Smat2_b)
+    # Compute the carrier density and scale factor
+    carrier_b <- density(x = y_agg_b, kernel = "gaussian", n = K, from = l, to = u)
+    scale_factor_b <- (ncells * nrow(Smat_b)) / sum(carrier_b$y)
+    carrier_est_b <- carrier_b$y * scale_factor_b
+    # Prepare data frames for Poisson regression
+    df1_b <- data.frame(sum_cts = colSums(Smat1_b), carrier_est_b, X)
+    df2_b <- data.frame(sum_cts = colSums(Smat2_b), carrier_est_b, X)
+    # Construct the formula for GLM
+    formula <- as.formula(paste0("sum_cts~offset(log(carrier_est_b))+", paste(colnames(X)[-1], collapse = "+")))
+    # Fit Poisson GLM for both groups and compute coefficient differences
+    beta1_b <- tryCatch(coef(glm(formula, family = poisson(link = "log"), data = df1_b)), error = function(e) rep(NA, ncol(X)))
+    beta2_b <- tryCatch(coef(glm(formula, family = poisson(link = "log"), data = df2_b)), error = function(e) rep(NA, ncol(X)))
+    beta_diff_b <- beta1_b - beta2_b
+    # Store the results
+    betaMat_diff_b[b, ] <- beta_diff_b
+    
+    sef_df1_b = as.vector( carrier_est_b * exp(X %*% beta1_b) )
+    sef_df2_b = as.vector( carrier_est_b * exp(X %*% beta2_b) )  
+    
+    Cov1b = mom_cov(Y1b, p)
+    Cov2b = mom_cov(Y2b, p) 
+    Sand1_b = t(X_dec) %*% ( sef_df1_b * X_dec )/(n1*ncells)
+    Sand2_b = t(X_dec) %*% ( sef_df2_b * X_dec )/(n2*ncells)
+    Sand1_inv_b = solve(Sand1_b)
+    Sand2_inv_b = solve(Sand2_b)
+    Cov_beta1_b = Sand1_inv_b%*%Cov1b%*%Sand1_inv_b
+    Cov_beta2_b = Sand2_inv_b%*%Cov2b%*%Sand2_inv_b
+    Zscore_b = (beta_diff_b[-1] - beta_sum_diff)/sqrt(diag(Cov_beta1_b + Cov_beta2_b) )
+    # Percentile t method 
+    ZscoreMat_b = rbind(ZscoreMat_b, Zscore_b) 
+  }
+  
+  return(list(betaMat_diff = betaMat_diff_b, ZscoreMat_b = ZscoreMat_b))
+}
 
+# Usage
+
+start.time <- Sys.time()
+result <- bootstrap_analysis(Y1, Y2, X, est_grid, K, l, u, B, ncells)
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+# Percentile method  
+betaMat_diff_percent = result$betaMat_diff[ ,-1]
+betaMat_diff_percent = betaMat_diff_percent[!rowSums( is.na(betaMat_diff_percent)), ]
+beta_sum_diff 
+pv_percent = NULL 
+for (i in 1:ncol(betaMat_diff_percent) ) {
+  pv_percent = c(pv_percent, mean(abs(betaMat_diff_percent[ ,i] - beta_sum_diff[i]) > abs(beta_sum_diff[i]) ) )
+}
+pv_percent
